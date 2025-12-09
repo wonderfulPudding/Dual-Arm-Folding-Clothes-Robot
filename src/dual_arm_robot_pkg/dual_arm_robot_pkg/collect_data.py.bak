@@ -1,0 +1,344 @@
+#!/usr/bin/env python3
+"""
+print("=== collect_data.py 시작 ===")
+텔레오퍼레이션 데이터 수집 (15 에피소드, 45초)
+"""
+
+import numpy as np
+import cv2
+import json
+import time
+from pathlib import Path
+import glob
+
+from dynamixel_sdk import *
+
+PROTOCOL_VERSION = 1.0
+BAUDRATE = 1000000
+
+LEADER1_IDS = list(range(21, 27))
+LEADER2_IDS = list(range(31, 37))
+FOLLOWER1_IDS = list(range(1, 7))
+FOLLOWER2_IDS = list(range(11, 17))
+
+ADDR_TORQUE_ENABLE = 24
+ADDR_GOAL_POSITION = 30
+ADDR_PRESENT_POSITION = 36
+ADDR_MOVING_SPEED = 32
+
+
+def detect_ports():
+    """자동 포트 감지"""
+    acm_ports = sorted(glob.glob("/dev/ttyACM*"))
+    usb_ports = sorted(glob.glob("/dev/ttyUSB*"))
+    
+    config = {}
+    if len(acm_ports) >= 2:
+        config['leader1'] = acm_ports[0]
+        config['leader2'] = acm_ports[1]
+    if len(usb_ports) >= 2:
+        config['follower1'] = usb_ports[0]
+        config['follower2'] = usb_ports[1]
+    
+    return config
+
+
+class DataCollector:
+    def __init__(self, data_root="~/handkerchief_robot_dual_data", fps=30, camera_index=0):
+        self.data_root = Path(data_root).expanduser()
+        self.data_root.mkdir(parents=True, exist_ok=True)
+        
+        self.fps = fps
+        self.dt = 1.0 / fps
+        self.camera_index = camera_index
+        
+        self.current_episode = None
+        self.episode_num = self._get_next_episode_num()
+        self.camera = None
+        
+        # 포트 설정
+        ports = detect_ports()
+        self.ph_leader1 = None
+        self.ph_leader2 = None
+        self.ph_follower1 = None
+        self.ph_follower2 = None
+        self.pkt_handler = None
+        
+        self.ports = ports
+        
+        print(f"[DataCollector] 초기화")
+        print(f"  저장 경로: {self.data_root}")
+        print(f"  FPS: {self.fps}")
+    
+    def _get_next_episode_num(self):
+        episodes = list(self.data_root.glob("episode_*"))
+        if not episodes:
+            return 0
+        nums = [int(e.name.split("_")[1]) for e in episodes]
+        return max(nums) + 1
+    
+    def connect_robot(self):
+        print("\n[로봇 연결]")
+        try:
+            self.pkt_handler = PacketHandler(PROTOCOL_VERSION)
+            
+            self.ph_leader1 = PortHandler(self.ports['leader1'])
+            self.ph_leader1.openPort()
+            self.ph_leader1.setBaudRate(BAUDRATE)
+            print(f"  ✓ 리더 1: {self.ports['leader1']}")
+            
+            self.ph_leader2 = PortHandler(self.ports['leader2'])
+            self.ph_leader2.openPort()
+            self.ph_leader2.setBaudRate(BAUDRATE)
+            print(f"  ✓ 리더 2: {self.ports['leader2']}")
+            
+            self.ph_follower1 = PortHandler(self.ports['follower1'])
+            self.ph_follower1.openPort()
+            self.ph_follower1.setBaudRate(BAUDRATE)
+            print(f"  ✓ 팔로워 1: {self.ports['follower1']}")
+            
+            self.ph_follower2 = PortHandler(self.ports['follower2'])
+            self.ph_follower2.openPort()
+            self.ph_follower2.setBaudRate(BAUDRATE)
+            print(f"  ✓ 팔로워 2: {self.ports['follower2']}")
+            
+            # 모터 설정
+            for motor_id in LEADER1_IDS:
+                self.pkt_handler.write1ByteTxRx(self.ph_leader1, motor_id, ADDR_TORQUE_ENABLE, 0)
+            for motor_id in LEADER2_IDS:
+                self.pkt_handler.write1ByteTxRx(self.ph_leader2, motor_id, ADDR_TORQUE_ENABLE, 0)
+            
+            for motor_id in FOLLOWER1_IDS:
+                self.pkt_handler.write1ByteTxRx(self.ph_follower1, motor_id, ADDR_TORQUE_ENABLE, 1)
+                self.pkt_handler.write2ByteTxRx(self.ph_follower1, motor_id, ADDR_MOVING_SPEED, 1023)
+            for motor_id in FOLLOWER2_IDS:
+                self.pkt_handler.write1ByteTxRx(self.ph_follower2, motor_id, ADDR_TORQUE_ENABLE, 1)
+                self.pkt_handler.write2ByteTxRx(self.ph_follower2, motor_id, ADDR_MOVING_SPEED, 1023)
+            
+            print("  ✓ 모터 설정 완료")
+        
+        except Exception as e:
+            print(f"  ✗ 연결 실패: {e}")
+            raise
+    
+    def disconnect_robot(self):
+        if self.ph_leader1:
+            self.ph_leader1.closePort()
+        if self.ph_leader2:
+            self.ph_leader2.closePort()
+        if self.ph_follower1:
+            self.ph_follower1.closePort()
+        if self.ph_follower2:
+            self.ph_follower2.closePort()
+    
+    def _init_camera(self):
+        self.camera = cv2.VideoCapture(self.camera_index)
+        self.camera.set(cv2.CAP_PROP_FRAME_WIDTH, 1920)
+        self.camera.set(cv2.CAP_PROP_FRAME_HEIGHT, 1080)
+        self.camera.set(cv2.CAP_PROP_FPS, self.fps)
+    
+    def _close_camera(self):
+        if self.camera:
+            self.camera.release()
+    
+    def start_episode(self):
+        episode_dir = self.data_root / f"episode_{self.episode_num:06d}"
+        episode_dir.mkdir(parents=True, exist_ok=True)
+        
+        obs_dir = episode_dir / "observations"
+        obs_dir.mkdir(exist_ok=True)
+        
+        self.current_episode = {
+            'episode_dir': episode_dir,
+            'obs_dir': obs_dir,
+            'start_time': time.time(),
+            'frames': [],
+            'follower1_positions': [],
+            'follower2_positions': [],
+            'timestamps': [],
+        }
+        
+        self._init_camera()
+        print(f"\n[에피소드 {self.episode_num}] 시작")
+    
+    def record_step(self, duration=45.0):
+        print(f"  {duration}초 기록 중...")
+        
+        start_time = time.time()
+        frame_count = 0
+        
+        try:
+            while (time.time() - start_time) < duration:
+                loop_start = time.time()
+                
+                # 1. 텔레오퍼레이션
+                leader1_pos = []
+                for motor_id in LEADER1_IDS:
+                    try:
+                        pos, _, _ = self.pkt_handler.read2ByteTxRx(self.ph_leader1, motor_id, ADDR_PRESENT_POSITION)
+                        leader1_pos.append(pos)
+                    except:
+                        leader1_pos.append(512)
+                
+                leader2_pos = []
+                for motor_id in LEADER2_IDS:
+                    try:
+                        pos, _, _ = self.pkt_handler.read2ByteTxRx(self.ph_leader2, motor_id, ADDR_PRESENT_POSITION)
+                        leader2_pos.append(pos)
+                    except:
+                        leader2_pos.append(512)
+                
+                # 2. 팔로워에 명령
+                for i, motor_id in enumerate(FOLLOWER1_IDS):
+                    try:
+                        self.pkt_handler.write2ByteTxRx(self.ph_follower1, motor_id, ADDR_GOAL_POSITION, int(leader1_pos[i]))
+                    except:
+                        pass
+                
+                time.sleep(0.002)
+                
+                for i, motor_id in enumerate(FOLLOWER2_IDS):
+                    try:
+                        self.pkt_handler.write2ByteTxRx(self.ph_follower2, motor_id, ADDR_GOAL_POSITION, int(leader2_pos[i]))
+                    except:
+                        pass
+                
+                # 3. 팔로워 상태 읽기
+                follower1_pos = []
+                for motor_id in FOLLOWER1_IDS:
+                    try:
+                        pos, _, _ = self.pkt_handler.read2ByteTxRx(self.ph_follower1, motor_id, ADDR_PRESENT_POSITION)
+                        follower1_pos.append(pos)
+                    except:
+                        follower1_pos.append(512)
+                
+                follower2_pos = []
+                for motor_id in FOLLOWER2_IDS:
+                    try:
+                        pos, _, _ = self.pkt_handler.read2ByteTxRx(self.ph_follower2, motor_id, ADDR_PRESENT_POSITION)
+                        follower2_pos.append(pos)
+                    except:
+                        follower2_pos.append(512)
+                
+                # 4. 카메라 촬영
+                ret, frame = self.camera.read()
+                if not ret:
+                    break
+                
+                # 5. 저장
+                self.current_episode['follower1_positions'].append(np.array(follower1_pos, dtype=np.float32))
+                self.current_episode['follower2_positions'].append(np.array(follower2_pos, dtype=np.float32))
+                self.current_episode['frames'].append(frame)
+                self.current_episode['timestamps'].append(time.time())
+                
+                frame_count += 1
+                
+                if frame_count % 30 == 0:
+                    elapsed = time.time() - start_time
+                    print(f"    ▌ {frame_count} 프레임 ({elapsed:.1f}초)")
+                
+                elapsed = time.time() - loop_start
+                if elapsed < self.dt:
+                    time.sleep(self.dt - elapsed)
+        
+        except KeyboardInterrupt:
+            print("  ✗ 중단됨")
+        
+        print(f"  ✓ {frame_count} 프레임 기록 완료")
+    
+    def save_episode(self):
+        episode_dir = self.current_episode['episode_dir']
+        obs_dir = self.current_episode['obs_dir']
+        
+        print(f"  저장 중...")
+        
+        # 팔로워 위치 저장
+        follower1_data = np.array(self.current_episode['follower1_positions'])
+        np.save(obs_dir / "follower1_positions.npy", follower1_data)
+        
+        follower2_data = np.array(self.current_episode['follower2_positions'])
+        np.save(obs_dir / "follower2_positions.npy", follower2_data)
+        
+        # 타임스탬프 저장
+        timestamps = np.array(self.current_episode['timestamps'])
+        np.save(obs_dir / "timestamps.npy", timestamps)
+        
+        # 영상 저장
+        frames = self.current_episode['frames']
+        if frames:
+            video_path = obs_dir / "camera.mp4"
+            fourcc = cv2.VideoWriter_fourcc(*'mp4v')
+            out = cv2.VideoWriter(
+                str(video_path),
+                fourcc,
+                self.fps,
+                (frames[0].shape[1], frames[0].shape[0])
+            )
+            for frame in frames:
+                out.write(frame)
+            out.release()
+        
+        # 메타데이터 저장
+        metadata = {
+            'episode_index': self.episode_num,
+            'task': 'fold_handkerchief',
+            'num_frames': len(frames),
+            'fps': self.fps,
+            'dof': 12,
+        }
+        with open(episode_dir / "metadata.json", "w") as f:
+            json.dump(metadata, f, indent=2)
+        
+        print(f"  ✓ 에피소드 {self.episode_num} 저장 완료")
+        
+        self._close_camera()
+        self.current_episode = None
+        self.episode_num += 1
+
+
+def main():
+    print("\n" + "="*60)
+    print("텔레오퍼레이션 데이터 수집 (15 에피소드, 45초)")
+    print("="*60)
+    
+    collector = DataCollector()
+    
+    try:
+        collector.connect_robot()
+        
+        for ep in range(15):
+            print(f"\n{'='*60}")
+            print(f"에피소드 {ep+1}/15")
+            print(f"{'='*60}")
+            
+            print(f"\n준비 확인:")
+            print(f"  - 리더 암이 안전한 위치?")
+            print(f"  - 손수건이 준비됐는가?")
+            print(f"  - 카메라가 팔로워 암을 촬영하는가?")
+            
+            input(f"\n준비되면 Enter를 누르세요...")
+            
+            collector.start_episode()
+            collector.record_step(duration=45.0)
+            collector.save_episode()
+            
+            if ep < 14:
+                print(f"\n다음 에피소드 준비 (남은 에피소드: {14-ep}개)")
+                input("준비되면 Enter를 누르세요...")
+        
+        print(f"\n{'='*60}")
+        print(f"✓ 모든 데이터 수집 완료!")
+        print(f"{'='*60}")
+        print(f"\n수집 결과:")
+        print(f"  저장 위치: {collector.data_root}")
+        print(f"  에피소드: 15개")
+        print(f"  총 프레임: 약 {15 * 45 * 30}개")
+        print(f"\n다음 단계: python convert_to_lerobot.py\n")
+    
+    except Exception as e:
+        print(f"\n✗ 에러: {e}")
+        import traceback
+        traceback.print_exc()
+    
+    finally:
+        collector.disconnect_robot()
