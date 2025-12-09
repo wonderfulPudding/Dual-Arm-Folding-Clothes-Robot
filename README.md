@@ -4,9 +4,9 @@ This project is the final project files and source codes for the first-yesr "Art
 For those of you who are going to see this project :
 This projectis pretty messy.
 It was caused by my lack of skills and experience, and i got help from AI in buding the code and development environment for this project,and in many ways.
-But i`m going to start this project again give without the help of AI.
+But i\'m going to start this project again give without the help of AI.
 So please give me your advice.
-And i`m going to post some of my clumsy projects soon.
+And i\`m going to post some of my clumsy projects soon.
 Thank you!
 
 
