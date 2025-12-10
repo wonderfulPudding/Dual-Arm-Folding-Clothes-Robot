@@ -21,6 +21,9 @@ Thank you!
 - dual_robot.py #텔레오퍼레이션 테스트
 - train_lerobot_tensorborad.py #simpleACT학습 + tensorborad 모니터링
 
+아래는 학습시킬때 사용한 데이터셋과 최종 모델 및 체크포인트 모델들이 있는 클라우드 링크입니다.
+https://drive.google.com/drive/folders/1AGqsZxUPQ7VrV-A_FtMHdqYZ6paAG11U?usp=sharing
+
 
 **주의**
 - 위의 파일 명에서 lerobot이 들어가지만, **lerobot 프레임워크를 사용하지 않습니다.**
